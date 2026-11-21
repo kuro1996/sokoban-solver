@@ -6,10 +6,14 @@
 // is the sum of the rooms' optima. Each room is solved push-optimally with a
 // breadth-first search over pushes (a state is the boxes' squares plus the
 // player's reachable region), pruned by dead squares (a box that can never be
-// pushed onto any goal) and frozen 2x2 blocks. If a room's BFS exhausts its
-// work budget, or the level does not split into rooms, a push-based A* with a
-// min-cost box-to-goal assignment heuristic takes over so the level still gets
-// a valid (if not optimal) answer instead of an empty one.
+// pushed onto any goal) and frozen 2x2 blocks.
+//
+// Fallback ladder (each rung only runs when the one above it gives up, so the
+// common case stays fast): room BFS -> room A* -> room A* again with a doubled
+// work budget -> whole-level A* -> whole-level A* with a doubled budget. The
+// A* rungs use a min-cost box-to-goal assignment heuristic, so a level still
+// gets a valid (if not optimal) answer instead of an empty one when a room
+// proves too big for the BFS.
 //
 // Deterministic by construction: fixed search order, work-based budgets only,
 // no clock, no randomness, no environment reads. Two runs write the same bytes.
@@ -22,6 +26,8 @@ const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 // Work budgets (state counts, never the clock): a room the generator keeps is
 // solvable within 250k states by its own push search, so 300k leaves margin.
+// Each A* rung gets one second chance at twice the budget: a room that only
+// just overflows the first budget still gets solved instead of abandoned.
 const BFS_MAX_STATES = 300_000;
 const ASTAR_MAX_STATES = 300_000;
 const WHOLE_MAX_STATES = 400_000;
@@ -47,6 +53,8 @@ interface Solution {
   pushes: number;
   moves: string;
 }
+
+// ── Section 1: parsing and board analysis ──
 
 /** Parse XSB text (# wall, space floor, . goal, $ box, * box on goal, @ player). */
 function parseLevel(text: string): Level {
@@ -195,6 +203,39 @@ function solved(boxes: number[], goal: Uint8Array): boolean {
 }
 
 /**
+ * Rebuild the player's moves from a search's parent chain: for each push in
+ * order, walk to the square behind the pushed box, then push. Shared by the
+ * BFS and the A* — both record the same parent/box arrays — so one
+ * implementation serves both searches and a fix here fixes both.
+ */
+function rebuildMoves(level: Level, statesBoxes: number[][], parent: number[], found: number): Solution {
+  const { w } = level;
+  const occupied = new Uint8Array(level.wall.length);
+  const path: number[] = [];
+  for (let s = found; s > 0; s = parent[s]!) path.push(s);
+  path.reverse();
+  let moves = '';
+  let player = level.player;
+  let boxes = level.boxes;
+  for (const s of path) {
+    const nextBoxes = statesBoxes[s]!;
+    const from = boxes.find((b) => !nextBoxes.includes(b))!;
+    const to = nextBoxes.find((b) => !boxes.includes(b))!;
+    const d = to - from;
+    const dir = DIRS.find(([dx, dy]) => dy * w + dx === d)!;
+    for (const b of boxes) occupied[b] = 1;
+    moves += walkTo(level, occupied, player, from - d);
+    for (const b of boxes) occupied[b] = 0;
+    moves += dir[3];
+    player = from;
+    boxes = nextBoxes;
+  }
+  return { pushes: path.length, moves };
+}
+
+// ── Section 2: the two push searches (BFS, then A*) ──
+
+/**
  * Push-optimal solution by breadth-first search over pushes, at most
  * `maxStates` states. States are visited in order of pushes made, so the
  * first solved state found is optimal. Null when the budget runs out or the
@@ -268,27 +309,7 @@ function solvePushBFS(level: Level, maxStates: number): Solution | null {
   }
   if (found < 0) return null;
 
-  // Rebuild the moves: walk to each push's square, then push.
-  const path: number[] = [];
-  for (let s = found; s > 0; s = parent[s]!) path.push(s);
-  path.reverse();
-  let moves = '';
-  let player = level.player;
-  let boxes = level.boxes;
-  for (const s of path) {
-    const nextBoxes = statesBoxes[s]!;
-    const from = boxes.find((b) => !nextBoxes.includes(b))!;
-    const to = nextBoxes.find((b) => !boxes.includes(b))!;
-    const d = to - from;
-    const dir = DIRS.find(([dx, dy]) => dy * w + dx === d)!;
-    for (const b of boxes) occupied[b] = 1;
-    moves += walkTo(level, occupied, player, from - d);
-    for (const b of boxes) occupied[b] = 0;
-    moves += dir[3];
-    player = from;
-    boxes = nextBoxes;
-  }
-  return { pushes: path.length, moves };
+  return rebuildMoves(level, statesBoxes, parent, found);
 }
 
 /**
@@ -496,27 +517,10 @@ function solvePushAStar(level: Level, maxStates: number): Solution | null {
   }
   if (found < 0) return null;
 
-  const path: number[] = [];
-  for (let s = found; s > 0; s = parent[s]!) path.push(s);
-  path.reverse();
-  let moves = '';
-  let player = level.player;
-  let boxes = level.boxes;
-  for (const s of path) {
-    const nextBoxes = statesBoxes[s]!;
-    const from = boxes.find((b) => !nextBoxes.includes(b))!;
-    const to = nextBoxes.find((b) => !boxes.includes(b))!;
-    const d = to - from;
-    const dir = DIRS.find(([dx, dy]) => dy * w + dx === d)!;
-    for (const b of boxes) occupied[b] = 1;
-    moves += walkTo(level, occupied, player, from - d);
-    for (const b of boxes) occupied[b] = 0;
-    moves += dir[3];
-    player = from;
-    boxes = nextBoxes;
-  }
-  return { pushes: path.length, moves };
+  return rebuildMoves(level, statesBoxes, parent, found);
 }
+
+// ── Section 3: room decomposition and the fallback ladder ──
 
 interface Room {
   squares: number[];
@@ -588,7 +592,13 @@ function solveByRooms(level: Level): Solution | null {
       boxes: room.boxes.slice().sort((a, b) => a - b),
       player,
     };
-    const solvedRoom = solvePushBFS(sub, BFS_MAX_STATES) ?? solvePushAStar(sub, ASTAR_MAX_STATES);
+    // Fallback ladder for one room: push-optimal BFS, then A*, then A* once
+    // more with a doubled work budget (a room that only just overflows the
+    // first A* budget still gets solved instead of failing the whole level).
+    const solvedRoom =
+      solvePushBFS(sub, BFS_MAX_STATES) ??
+      solvePushAStar(sub, ASTAR_MAX_STATES) ??
+      solvePushAStar(sub, ASTAR_MAX_STATES * 2);
     if (solvedRoom === null) return null;
     pushes += solvedRoom.pushes;
     moves += solvedRoom.moves;
@@ -599,6 +609,7 @@ function solveByRooms(level: Level): Solution | null {
 }
 
 /** Solve one level's text: room by room, else whole-level A*, else empty. */
+// ── Section 4: driver ──
 function solve(text: string): string {
   const level = parseLevel(text);
   if (level.player < 0 || level.boxes.length === 0) return '';
@@ -607,7 +618,9 @@ function solve(text: string): string {
   if (solved(level.boxes, goal)) return '';
   const byRooms = solveByRooms(level);
   if (byRooms !== null) return byRooms.moves;
-  const whole = solvePushAStar(level, WHOLE_MAX_STATES);
+  // Last resort, same second-chance rule as the per-room ladder: whole-level
+  // A*, then once more with a doubled work budget.
+  const whole = solvePushAStar(level, WHOLE_MAX_STATES) ?? solvePushAStar(level, WHOLE_MAX_STATES * 2);
   return whole === null ? '' : whole.moves;
 }
 

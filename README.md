@@ -21,10 +21,12 @@ count is the sum of the rooms' optima. The solver exploits that:
 3. **Deadlock pruning** — dead squares (a box that can never be pushed onto
    any goal, found by pulling a box back from the goals) and frozen 2×2
    blocks of walls and boxes.
-4. **A\* fallback** — if a room's BFS exhausts its work budget, or a level
-   does not split into rooms, a push-based A\* with a min-cost box→goal
-   assignment heuristic (exact by permutation up to 4 boxes) still returns a
-   valid solution instead of an empty one.
+4. **A\* fallback ladder** — if a room's BFS exhausts its work budget, a
+   push-based A\* with a min-cost box→goal assignment heuristic (exact by
+   permutation up to 4 boxes) still returns a valid solution instead of an
+   empty one; each A\* rung gets one second chance at twice the budget, and
+   a level that does not split into rooms falls back to whole-level A\* the
+   same way.
 
 Budgets are state counts, never the clock, and the search order is fixed, so
 two runs write byte-identical outputs. The whole practice set solves in
